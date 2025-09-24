@@ -1,0 +1,10 @@
+{
+  "age_values": [40, 65],
+  "scenario_values": ["baseline", "policy"],
+  "lookup": {
+    "40|baseline": "data/results_age-40_scn-baseline.csv",
+    "40|policy": "data/results_age-40_scn-policy.csv",
+    "65|baseline": "data/results_age-65_scn-baseline.csv",
+    "65|policy": "data/results_age-65_scn-policy.csv"
+  }
+}
