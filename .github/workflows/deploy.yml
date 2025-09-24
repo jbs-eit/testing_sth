@@ -24,22 +24,33 @@ jobs:
       - name: Set up R
         uses: r-lib/actions/setup-r@v2
 
-      - name: Cache R packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/R
-          key: ${{ runner.os }}-R-${{ hashFiles('**/DESCRIPTION') }}
-          restore-keys: ${{ runner.os }}-R-
+      - name: Set up Pandoc
+        uses: r-lib/actions/setup-pandoc@v2
 
-      - name: Install system deps (for rlang/DT etc.)
-        run: sudo apt-get update
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          # Common build deps for CRAN pkgs (harmless if already present)
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
 
-      - name: Install R packages
+      - name: Install R packages (with fallback for shinylive)
         shell: Rscript {0}
         run: |
-          install.packages(c("shiny","jsonlite","ggplot2","DT","shinylive",
-          "here"), 
-          repos="https://cloud.r-project.org")
+          repos <- c(CRAN = "https://cloud.r-project.org")
+          base_pkgs <- c("shiny","jsonlite","ggplot2","DT","here")
+          install.packages(base_pkgs, repos = repos)
+          # Try CRAN first
+          tryCatch(
+            install.packages("shinylive", repos = repos),
+            error = function(e) message("CRAN shinylive install failed, will try GitHub…")
+          )
+          if (!requireNamespace("shinylive", quietly = TRUE)) {
+            if (!requireNamespace("remotes", quietly = TRUE)) {
+              install.packages("remotes", repos = repos)
+            }
+            remotes::install_github("posit-dev/r-shinylive")
+          }
+          stopifnot(requireNamespace("shinylive", quietly = TRUE))
 
       - name: Build data (precompute CSVs + manifest)
         shell: Rscript {0}
@@ -47,7 +58,7 @@ jobs:
 
       - name: Export Shinylive site
         shell: Rscript {0}
-        run: shinylive::export(appdir="sim-dashboard", destdir="dist")
+        run: shinylive::export(appdir = "sim-dashboard", destdir = "dist")
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
