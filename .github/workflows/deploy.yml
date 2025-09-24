@@ -41,11 +41,11 @@ jobs:
 
       - name: Build data (precompute CSVs + manifest)
         shell: Rscript {0}
-        run: source("data_prep.R")
+        run: source("sim-dashboard/data_prep.R")
 
       - name: Export Shinylive site
         shell: Rscript {0}
-        run: shinylive::export(appdir=".", destdir="dist")
+        run: shinylive::export(appdir="sim-dashboard", destdir="dist")
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
