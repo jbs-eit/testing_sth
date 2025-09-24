@@ -37,7 +37,9 @@ jobs:
       - name: Install R packages
         shell: Rscript {0}
         run: |
-          install.packages(c("shiny","jsonlite","ggplot2","DT","shinylive"), repos="https://cloud.r-project.org")
+          install.packages(c("shiny","jsonlite","ggplot2","DT","shinylive",
+          "here"), 
+          repos="https://cloud.r-project.org")
 
       - name: Build data (precompute CSVs + manifest)
         shell: Rscript {0}
