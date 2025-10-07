@@ -1,17 +1,16 @@
 # app.py
 # -------------------------------------------------------------
-# Economic Simulation Prototype (Streamlit) — with Model Estimation & Selection
-# -------------------------------------------------------------
-# How to run:
-#   1) pip install -r requirements.txt
-#   2) streamlit run app.py
+# Economic Simulation Prototype (Streamlit)
+#   • Model Estimation & Selection workflow
+#   • Multi-intervention config
+#   • Pipeline JSON export (decisions so far)
 # -------------------------------------------------------------
 from __future__ import annotations
 
 import json
 import math
 import re
-from dataclasses import dataclass
+import time
 from io import StringIO, BytesIO
 from typing import Dict, List, Tuple, Any, Optional
 
@@ -20,31 +19,30 @@ import pandas as pd
 import altair as alt
 import streamlit as st
 
-# ML imports
+# ML imports (XGBoost optional)
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, log_loss
 from sklearn.linear_model import LinearRegression, LogisticRegression
-from sklearn.metrics import (
-    mean_squared_error, mean_absolute_error, r2_score,
-    brier_score_loss, roc_auc_score, log_loss, accuracy_score
-)
+from sklearn.calibration import calibration_curve
 
 try:
-    import xgboost as xgb
-    HAS_XGB = True
+    from xgboost import XGBRegressor, XGBClassifier  # type: ignore
+    XGB_AVAILABLE = True
 except Exception:
-    HAS_XGB = False
+    XGB_AVAILABLE = False
 
 # --------------------------- Page Setup ---------------------------
 st.set_page_config(
-    page_title="Economic Simulation Prototype",
+    page_title="Simulation Engine for Preventative Health Interventions - Prototype",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # --------------------------- Utilities ---------------------------
+NUMERIC_LIKE = {"int64", "int32", "float64", "float32", "int16", "float16"}
+
 def _safe_read_byteslike(file_obj: BytesIO | StringIO) -> str:
-    """Return text from a Streamlit uploaded file (BytesIO or StringIO)."""
     try:
         if isinstance(file_obj, BytesIO):
             return file_obj.getvalue().decode("utf-8", errors="ignore")
@@ -57,14 +55,13 @@ def _safe_read_byteslike(file_obj: BytesIO | StringIO) -> str:
 
 
 def clean_loose_json(text: str) -> str:
-    """Make 'loose' JSON loadable: strip comments, ellipses, trailing commas."""
     if not isinstance(text, str):
         return text
-    text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)        # // comments
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)        # /* */ comments
+    text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
     text = re.sub(r'\s*"\.{3}"\s*:\s*(".*?"|\{.*?\}|\[.*?\]|true|false|null|-?\d+\.?\d*)\s*,?', "", text, flags=re.DOTALL)
-    text = re.sub(r'\s*"\.{3}"\s*,?', "", text)                   # "..." entries in arrays
-    text = re.sub(r",\s*([}\]])", r"\1", text)                    # dangling commas
+    text = re.sub(r'\s*"\.{3}"\s*,?', "", text)
+    text = re.sub(r",\s*([}\]])", r"\1", text)
     return text.strip()
 
 
@@ -80,42 +77,32 @@ def load_config_from_text(text: str) -> Tuple[Dict[str, Any], str]:
 
 
 def default_config() -> Dict[str, Any]:
-    """Minimal default config. The new workflow ignores specific structure here by design."""
     return {
-        "data": "ukhls",
-        "model_config": {},
-        "intervention_config": {
-            "bmi": {
-                "type": "percentage_decrease",
-                "amount": 0.2,
-                "target_population": {"age": [40, 60], "bmi": [30, 100]},
-            }
+        "meta": {"name": "Demo Scenario"},
+        # unified place where we store decisions for export
+        "pipeline": {
+            "estimation": {},        # per-target configs as recorded by the user
+            "trained": {},           # per-target metrics (no model objects)
+            "selection": {},         # chosen model per target
+            "interventions": [],     # list of interventions
         },
     }
 
 
-def _range_to_tuple(val: Any, fallback: Tuple[float, float]) -> Tuple[float, float]:
-    try:
-        if isinstance(val, (list, tuple)) and len(val) == 2:
-            return float(val[0]), float(val[1])
-    except Exception:
-        pass
-    return fallback
+def is_binary_series(s: pd.Series, threshold_unique: int = 2) -> bool:
+    vals = s.dropna().unique()
+    return len(vals) <= threshold_unique and set(vals).issubset({0, 1})
 
 
-# --------------------------- Synthetic Data + Model Stubs ---------------------------
+# --------------------------- Synthetic Data ---------------------------
 def generate_synthetic_population(n: int, seed: int = 42) -> pd.DataFrame:
-    """Create a synthetic micro-population (illustrative only)."""
     rng = np.random.default_rng(seed)
     ages = rng.integers(18, 90, size=n)
-
-    base_log_income = rng.normal(loc=10.5, scale=0.6, size=n)  # ~exp -> median ~$36k
+    base_log_income = rng.normal(loc=10.5, scale=0.6, size=n)
     age_effect = (ages - 45) / 45 * 0.15
     log_income = base_log_income + age_effect
-
     employed = rng.random(size=n) < (0.7 - 0.002 * np.clip(ages - 40, 0, None))
     employment_status = np.where(employed, "employed", "other")
-
     bmi = rng.normal(loc=25 + 0.03 * (ages - 45), scale=4.0, size=n)
     bmi = np.clip(bmi, 15, 60)
 
@@ -127,6 +114,9 @@ def generate_synthetic_population(n: int, seed: int = 42) -> pd.DataFrame:
             "bmi": bmi.astype(float),
         }
     )
+    df["prob_hattack_true"] = risk_heart_attack(df)
+    df["hattack_ever_w10"] = (rng.random(size=n) < df["prob_hattack_true"]).astype(int)
+    df["is_employed"] = (df["employment_status"] == "employed").astype(int)
     return df
 
 
@@ -135,146 +125,127 @@ def logistic(x: np.ndarray) -> np.ndarray:
 
 
 def risk_heart_attack(prob_inputs: pd.DataFrame) -> np.ndarray:
-    """
-    Toy probability of ever having a heart attack (illustrative, not clinical).
-    logit(p) = a + b1*((bmi-25)/5) + b2*((age-50)/10)
-    """
     bmi = prob_inputs["bmi"].to_numpy()
     age = prob_inputs["age"].to_numpy()
-    a, b1, b2 = -4.2, 0.50, 0.65
+    a = -4.2
+    b1 = 0.50
+    b2 = 0.65
     z = a + b1 * ((bmi - 25.0) / 5.0) + b2 * ((age - 50.0) / 10.0)
     return logistic(z)
 
 
-# --------------------------- Feature engineering helpers ---------------------------
-def get_variable_types(df: pd.DataFrame) -> Dict[str, str]:
-    """Return mapping of var -> {'binary','continuous','categorical'}"""
+# --------------------------- Feature Engineering ---------------------------
+def available_variables(df: pd.DataFrame) -> Dict[str, str]:
     out = {}
     for c in df.columns:
-        ser = df[c]
-        if pd.api.types.is_bool_dtype(ser) or (pd.api.types.is_integer_dtype(ser) and ser.dropna().isin([0,1]).all()):
+        if c in ("prob_hattack_true",):
+            continue
+        if is_binary_series(df[c]):
             out[c] = "binary"
-        elif pd.api.types.is_numeric_dtype(ser):
-            out[c] = "continuous"
+        elif str(df[c].dtype) in NUMERIC_LIKE:
+            out[c] = "numeric"
         else:
             out[c] = "categorical"
     return out
 
 
-def safe_log(x: pd.Series) -> pd.Series:
-    return np.log(np.clip(pd.to_numeric(x, errors="coerce"), 1e-12, None))
-
-
-def build_feature_matrix(
-    df: pd.DataFrame,
-    target: str,
-    features: List[str],
-    log_vars: List[str],
-    square_vars: List[str],
-    interactions: List[Tuple[str, str]],
-) -> Tuple[pd.DataFrame, pd.Series, List[str]]:
-    """
-    Construct a design matrix with:
-      - numeric features as-is
-      - categorical features one-hot encoded (drop_first=True)
-      - optional log/square expansions (numeric only)
-      - optional pairwise interactions for numeric vars
-    Returns X, y, and the final column order.
-    """
-    X_parts = []
-    var_types = get_variable_types(df)
-
-    # Base features
-    for v in features:
-        if v not in df.columns:
-            continue
-        if var_types.get(v) == "categorical":
-            dummies = pd.get_dummies(df[v], prefix=v, drop_first=True)
-            X_parts.append(dummies.astype(float))
-        else:
-            X_parts.append(pd.to_numeric(df[v], errors="coerce").to_frame(v))
-
-        # log
-        if v in log_vars and var_types.get(v) != "categorical":
-            X_parts.append(safe_log(df[v]).rename(f"log_{v}").to_frame())
-
-        # square
-        if v in square_vars and var_types.get(v) != "categorical":
-            X_parts.append((pd.to_numeric(df[v], errors="coerce")**2).rename(f"{v}_sq").to_frame())
-
-    X = pd.concat(X_parts, axis=1) if X_parts else pd.DataFrame(index=df.index)
-
-    # Interactions (only numeric-numeric to keep this demo manageable)
-    for a, b in interactions:
-        if a in df.columns and b in df.columns:
-            if pd.api.types.is_numeric_dtype(df[a]) and pd.api.types.is_numeric_dtype(df[b]):
-                X[f"{a}_x_{b}"] = pd.to_numeric(df[a], errors="coerce") * pd.to_numeric(df[b], errors="coerce")
-
-    X = X.replace([np.inf, -np.inf], np.nan)
-    y = df[target] if target in df.columns else pd.Series(index=df.index, dtype=float)
-
-    # Drop rows with any NA in X or y
-    valid = ~(X.isna().any(axis=1) | y.isna())
-    X = X.loc[valid]
-    y = y.loc[valid]
-
-    return X, y, list(X.columns)
-
-
-def ensure_same_columns(X_new: pd.DataFrame, cols_template: List[str]) -> pd.DataFrame:
-    """Add any missing columns (0) and drop extras; then align order to template."""
-    for c in cols_template:
-        if c not in X_new.columns:
-            X_new[c] = 0.0
-    extra = [c for c in X_new.columns if c not in cols_template]
-    if extra:
-        X_new = X_new.drop(columns=extra)
-    return X_new[cols_template]
-
-
-def calibration_table(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10) -> pd.DataFrame:
-    """Return a binned calibration table (mean predicted vs. observed fraction)."""
-    df = pd.DataFrame({"y": y_true.astype(int), "p": y_prob})
-    df = df.sort_values("p")
-    bins = np.array_split(df, n_bins)
+def compute_stats_table(df: pd.DataFrame, vtypes: Dict[str, str]) -> pd.DataFrame:
     rows = []
-    for i, b in enumerate(bins, 1):
-        if len(b) == 0:
-            continue
-        rows.append({
-            "bin": i,
-            "mean_pred": b["p"].mean(),
-            "frac_pos": b["y"].mean(),
-            "n": len(b),
-        })
+    for c, t in vtypes.items():
+        s = df[c]
+        if t in ("numeric", "binary"):
+            vals = s.dropna().to_numpy()
+            if vals.size == 0:
+                rows.append({"variable": c, "type": t, "min": None, "p10": None, "median": None, "mean": None, "p90": None, "max": None, "std": None})
+            else:
+                rows.append({
+                    "variable": c,
+                    "type": t,
+                    "min": float(np.nanmin(vals)),
+                    "p10": float(np.nanpercentile(vals, 10)),
+                    "median": float(np.nanmedian(vals)),
+                    "mean": float(np.nanmean(vals)),
+                    "p90": float(np.nanpercentile(vals, 90)),
+                    "max": float(np.nanmax(vals)),
+                    "std": float(np.nanstd(vals, ddof=1) if len(vals) > 1 else 0.0),
+                })
+        else:
+            rows.append({"variable": c, "type": t, "min": None, "p10": None, "median": None, "mean": None, "p90": None, "max": None, "std": None})
     return pd.DataFrame(rows)
 
 
-# --------------------------- Session State ---------------------------
-if "config" not in st.session_state:
-    st.session_state["config"] = default_config()
-if "trained_models" not in st.session_state:
-    # structure: {target: {model_key: {...}}}
-    st.session_state["trained_models"] = {}
-if "selected_models" not in st.session_state:
-    # structure: {target: "model_key"}
-    st.session_state["selected_models"] = {}
-if "estimation_specs" not in st.session_state:
-    # structure: {target: {...spec...}}
-    st.session_state["estimation_specs"] = {}
-if "raw_uploaded_text" not in st.session_state:
-    st.session_state["raw_uploaded_text"] = None
-if "cleaned_uploaded_text" not in st.session_state:
-    st.session_state["cleaned_uploaded_text"] = None
+def build_design_matrix(df: pd.DataFrame, target: str, spec: Dict[str, Any]) -> pd.DataFrame:
+    base = [b for b in spec.get("base_features", []) if b != target and b in df.columns]
+    df_work = pd.DataFrame(index=df.index)
+    for b in base:
+        df_work[b] = df[b]
+    # transforms (numeric only)
+    for b in spec.get("log", []):
+        if b in df.columns and str(df[b].dtype) in NUMERIC_LIKE:
+            df_work[f"log_{b}"] = np.log1p(np.clip(df[b].to_numpy(), a_min=0, a_max=None))
+    for b in spec.get("square", []):
+        if b in df.columns and str(df[b].dtype) in NUMERIC_LIKE:
+            df_work[f"{b}_sq"] = np.square(df[b])
+    # interactions (numeric)
+    for (u, v) in spec.get("interactions", []):
+        if u in df.columns and v in df.columns:
+            if (str(df[u].dtype) in NUMERIC_LIKE) and (str(df[v].dtype) in NUMERIC_LIKE):
+                df_work[f"{u}*{v}"] = df[u].to_numpy() * df[v].to_numpy()
+    # one-hot encode categoricals
+    X = pd.get_dummies(df_work, drop_first=True)
+    X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return X
+
+
+# --------------------------- Interventions ---------------------------
+def _range_to_tuple(val: Any, fallback: Tuple[float, float]) -> Tuple[float, float]:
+    try:
+        if isinstance(val, (list, tuple)) and len(val) == 2:
+            return float(val[0]), float(val[1])
+    except Exception:
+        pass
+    return fallback
+
+
+def apply_intervention(df: pd.DataFrame, inv: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Generic numeric intervention:
+      - inv["target"]: column name to change
+      - inv["type"]: "percentage_decrease" or "absolute_change"
+      - inv["amount"]: float
+      - inv["filters"]: {"age":[min,max], "bmi":[min,max]}  (optional)
+    """
+    new_df = df.copy()
+    target_var = inv.get("target")
+    if (target_var is None) or (target_var not in new_df.columns):
+        return new_df
+
+    iv_type = inv.get("type", "percentage_decrease")
+    amount = float(inv.get("amount", 0.0))
+    filters = inv.get("filters", {}) or {}
+
+    # build mask
+    mask = pd.Series(True, index=new_df.index)
+    if "age" in new_df.columns and "age" in filters:
+        a_min, a_max = _range_to_tuple(filters.get("age"), (new_df["age"].min(), new_df["age"].max()))
+        mask &= (new_df["age"] >= a_min) & (new_df["age"] <= a_max)
+    if "bmi" in new_df.columns and "bmi" in filters:
+        b_min, b_max = _range_to_tuple(filters.get("bmi"), (new_df["bmi"].min(), new_df["bmi"].max()))
+        mask &= (new_df["bmi"] >= b_min) & (new_df["bmi"] <= b_max)
+
+    if iv_type == "percentage_decrease":
+        new_df.loc[mask, target_var] = new_df.loc[mask, target_var] * (1.0 - amount)
+    elif iv_type == "absolute_change":
+        new_df.loc[mask, target_var] = new_df.loc[mask, target_var] + amount
+    return new_df
 
 
 # --------------------------- Sidebar ---------------------------
-def sidebar_config_controls(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    st.sidebar.header("⚙️ Scenario & Configuration")
-
+def sidebar_controls(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    st.sidebar.header("⚙️ Scenario & Data")
     st.sidebar.text_input("Scenario name", key="scenario_name", value=st.session_state.get("scenario_name", "Demo Scenario"))
 
-    st.sidebar.caption("Upload a configuration JSON (optional)")
+    st.sidebar.caption("Upload a configuration JSON (optional). Pipeline decisions will load if present.")
     uploaded = st.sidebar.file_uploader("Choose a JSON file", type=["json"], key="cfg_uploader")
     if uploaded is not None:
         raw_text = _safe_read_byteslike(uploaded)
@@ -282,485 +253,741 @@ def sidebar_config_controls(cfg: Dict[str, Any]) -> Dict[str, Any]:
             parsed, cleaned = load_config_from_text(raw_text)
             st.session_state["raw_uploaded_text"] = raw_text
             st.session_state["cleaned_uploaded_text"] = cleaned
-            st.session_state["config"] = parsed
+
+            # Merge into current config if keys present
+            st.session_state.setdefault("config", cfg)
+            pipe = parsed.get("pipeline") or {}
+            if pipe:
+                st.session_state["config"]["pipeline"] = pipe
+                # Restore into session_state for live UI
+                st.session_state["pending_estimations"] = list(pipe.get("estimation", {}).values())
+                st.session_state["trained_models_meta"] = pipe.get("trained", {})
+                st.session_state["chosen_models"] = pipe.get("selection", {})
+                st.session_state["interventions"] = pipe.get("interventions", [])
+            else:
+                # Backward-compat for older structure
+                if "intervention_config" in parsed:
+                    # convert dict to list
+                    inv_list = []
+                    for k, inv in (parsed.get("intervention_config") or {}).items():
+                        inv_list.append({
+                            "target": k,
+                            "type": inv.get("type","percentage_decrease"),
+                            "amount": inv.get("amount",0.0),
+                            "filters": inv.get("target_population",{})
+                        })
+                    st.session_state.setdefault("interventions", inv_list)
+
             st.sidebar.success("Configuration loaded.")
         except ValueError as e:
             st.sidebar.error(str(e))
 
+    st.sidebar.divider()
+    st.sidebar.caption("Global Simulation Settings")
+    pop_n = st.sidebar.number_input("Population size", min_value=2_000, max_value=300_000, value=30_000, step=1_000, key="pop_n")
+    seed = st.sidebar.number_input("Random seed", min_value=0, max_value=1_000_000, value=42, step=1, key="seed")
+    montecarlo_sims = st.sidebar.number_input("Monte Carlo simulations", min_value=100, max_value=10_000, value=1_000, step=100, key="mc_sims")
+
+    st.sidebar.divider()
+    st.sidebar.caption("Download pipeline configuration")
     st.sidebar.download_button(
-        label="💾 Download current config",
-        data=json.dumps(st.session_state.get("config", cfg), indent=2),
-        file_name="scenario_config.json",
+        "💾 Download pipeline JSON",
+        data=json.dumps(build_pipeline_json(), indent=2),
+        file_name="pipeline_config.json",
         mime="application/json",
         use_container_width=True,
     )
 
-    st.sidebar.divider()
-    st.sidebar.caption("Simulation Settings")
-    pop_n = st.sidebar.number_input("Population size (synthetic)", min_value=5_000, max_value=1_000_000, value=60_000, step=5_000)
-    seed = st.sidebar.number_input("Random seed", min_value=0, max_value=1_000_000, value=42, step=1)
-
-    st.session_state["pop_n"] = int(pop_n)
-    st.session_state["seed"] = int(seed)
-
     return st.session_state.get("config", cfg)
 
 
-# --------------------------- UI: Model Estimation ---------------------------
-def model_estimation_tab():
-    st.subheader("🧮 Model estimation")
+# --------------------------- Defaults Helper ---------------------------
+def apply_defaults_to_estimation():
+    # two defaults: bmi (continuous), hattack_ever_w10 (binary)
+    defaults = []
 
-    # Build / refresh an in-memory dataset for estimation
-    pop_n = int(st.session_state.get("pop_n", 60_000))
-    seed = int(st.session_state.get("seed", 42))
-    df = generate_synthetic_population(pop_n, seed=seed)
-    # Add a binary outcome for illustration
-    df["prob_hattack"] = risk_heart_attack(df)
-    rng = np.random.default_rng(seed + 10)
-    df["hattack_event"] = (rng.random(size=len(df)) < df["prob_hattack"]).astype(int)
+    # BMI regression
+    algos_reg = ["linear_regression"]
+    if XGB_AVAILABLE:
+        algos_reg.append("xgboost_regressor")
+    defaults.append({
+        "target": "bmi",
+        "target_type": "continuous",
+        "spec": {
+            "base_features": ["age", "log_income", "is_employed"],
+            "log": ["log_income"],
+            "square": ["age"],
+            "interactions": [("age", "log_income")],
+        },
+        "algorithms": algos_reg,
+        "train_test_split": {"test_size": 0.2, "random_state": 42, "stratify": None},
+    })
 
-    var_types = get_variable_types(df)
-    st.markdown("**Available variables in dataset**")
-    with st.container(border=True):
-        st.dataframe(pd.DataFrame({"variable": list(var_types.keys()), "type": list(var_types.values())}).sort_values("variable"), use_container_width=True, hide_index=True)
+    # Heart attack classification
+    algos_cls = ["logistic_regression"]
+    if XGB_AVAILABLE:
+        algos_cls.append("xgboost_classifier")
+    defaults.append({
+        "target": "hattack_ever_w10",
+        "target_type": "binary",
+        "spec": {
+            "base_features": ["age", "bmi", "is_employed"],
+            "log": [],
+            "square": ["age"],
+            "interactions": [("age", "bmi")],
+        },
+        "algorithms": algos_cls,
+        "train_test_split": {"test_size": 0.2, "random_state": 42, "stratify": "hattack_ever_w10"},
+    })
 
-    st.markdown("**Choose a target variable to estimate**")
-    # We allow continuous (regression) and binary (classification) targets
-    target_candidates = [v for v, t in var_types.items() if t in ("continuous", "binary")]
-    if not target_candidates:
-        st.warning("No suitable target variables found.")
+    st.session_state["pending_estimations"] = defaults
+    # Also set the UI to the first default
+    st.session_state["est_target"] = "bmi"
+    st.session_state["est_base_features"] = defaults[0]["spec"]["base_features"]
+    st.session_state["est_log_feats"] = defaults[0]["spec"]["log"]
+    st.session_state["est_sq_feats"] = defaults[0]["spec"]["square"]
+    st.session_state["est_interacts"] = [f"{u}|{v}" for (u,v) in defaults[0]["spec"]["interactions"]]
+    st.session_state["est_use_lin"] = True
+    st.session_state["est_use_xgb_reg"] = XGB_AVAILABLE
+    st.session_state["est_use_logit"] = False
+    st.session_state["est_use_xgb_cls"] = False
+    st.session_state["est_test_size"] = 0.2
+    st.session_state["est_random_state"] = 42
+    st.session_state["est_stratify"] = None
+
+
+def apply_defaults_to_selection():
+    # If not trained, attempt to train current pending
+    if not st.session_state.get("trained_models"):
+        train_all_recorded_models(show_progress=False)
+    # Choose default models: XGBoost where available else GLM
+    trained = st.session_state.get("trained_models", {})
+    chosen = {}
+    for tgt, pack in trained.items():
+        names = list(pack.get("models", {}).keys())
+        pick = None
+        for pref in ["XGBoost Regressor", "XGBoost Classifier", "Logistic Regression", "Linear Regression"]:
+            if pref in names:
+                pick = pref; break
+        pick = pick or (names[0] if names else None)
+        if pick:
+            chosen[tgt] = pick
+    st.session_state["chosen_models"] = chosen
+
+
+def apply_defaults_to_interventions(df: pd.DataFrame):
+    st.session_state["interventions"] = [
+        {"target": "bmi", "type": "percentage_decrease", "amount": 0.2, "filters": {"age": [40, 60], "bmi": [30, 100]}},
+        {"target": "bmi", "type": "percentage_decrease", "amount": 0.1, "filters": {"age": [60, 90], "bmi": [28, 100]}}
+    ]
+
+
+# --------------------------- Training Helpers ---------------------------
+def train_all_recorded_models(show_progress: bool = True):
+    df = st.session_state["training_data"]
+    pend = st.session_state.get("pending_estimations", [])
+    if not pend:
+        st.warning("No recorded configurations to train.")
         return
-    target = st.selectbox("Target variable", target_candidates, index=0)
 
-    task = "classification" if var_types[target] == "binary" else "regression"
-    st.caption(f"Detected task: **{task}**")
+    total_jobs = sum(len(p["algorithms"]) for p in pend)
+    progress = st.progress(0) if show_progress else None
+    done = 0
 
-    # Independent variables
-    candidate_X = [v for v in var_types.keys() if v != target and v not in ("prob_hattack",)]
-    default_feats = ["age", "log_income"] if target != "bmi" else ["age", "log_income"]
-    features = st.multiselect("Independent variables", candidate_X, default=[f for f in default_feats if f in candidate_X])
+    st.session_state.setdefault("trained_models", {})
+    st.session_state.setdefault("trained_models_meta", {})
 
-    # Transformations
-    numeric_feats = [f for f in features if var_types[f] == "continuous"]
-    with st.expander("Feature engineering", expanded=True):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            log_vars = st.multiselect("Apply log() to", numeric_feats, default=[v for v in numeric_feats if v.startswith("log_")])
-        with col2:
-            square_vars = st.multiselect("Add squared term", numeric_feats, default=[])
-        with col3:
-            st.markdown("**Interactions**")
-            inter_a = st.selectbox("Var A", ["—"] + numeric_feats, index=0, key="inter_a")
-            inter_b = st.selectbox("Var B", ["—"] + numeric_feats, index=0, key="inter_b")
-            if "interactions" not in st.session_state:
-                st.session_state["interactions"] = []
-            if st.button("➕ Add interaction (A × B)") and inter_a != "—" and inter_b != "—" and inter_a != inter_b:
-                st.session_state["interactions"].append((inter_a, inter_b))
-            # Display current interactions for this target (session-wide)
-            if st.session_state["interactions"]:
-                st.write(pd.DataFrame(st.session_state["interactions"], columns=["A", "B"]))
+    for p in pend:
+        target = p["target"]
+        ttype = p["target_type"]
+        spec = p["spec"]
+        algos = p["algorithms"]
+        tts = p["train_test_split"]
+        strat = tts.get("stratify") if ttype == "binary" else None
 
-    interactions = list(st.session_state.get("interactions", []))
+        y = df[target]
+        X = build_design_matrix(df, target, spec)
+        if ttype == "binary":
+            y = y.astype(int)
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=float(tts.get("test_size", 0.2)),
+            random_state=int(tts.get("random_state", 42)),
+            stratify=y if (ttype=="binary" and strat is not None) else None
+        )
 
-    # Model choices
-    st.markdown("**Choose models to train**")
-    if task == "regression":
-        available_models = ["linear_regression"] + (["xgboost_regressor"] if HAS_XGB else [])
-    else:
-        available_models = ["logistic_regression"] + (["xgboost_classifier"] if HAS_XGB else [])
-    chosen_models = st.multiselect("Models", available_models, default=[available_models[0]])
-
-    # Split
-    st.markdown("**Train/test split**")
-    c1, c2 = st.columns(2)
-    with c1:
-        test_size = st.slider("Test size", 0.05, 0.5, 0.2, 0.05)
-    with c2:
-        random_state = st.number_input("Random state", value=42, step=1)
-
-    # Train button
-    if st.button("🚀 Train selected models", type="primary", use_container_width=True, disabled=(len(features) == 0 or len(chosen_models) == 0)):
-        # Persist specification
-        st.session_state["estimation_specs"][target] = {
-            "features": features,
-            "log_vars": log_vars,
-            "square_vars": square_vars,
-            "interactions": interactions,
-            "task": task,
-            "test_size": float(test_size),
-            "random_state": int(random_state),
+        results: Dict[str, Any] = {
+            "type": ttype,
+            "feature_spec": spec,
+            "train_test_split": {"test_size": float(tts.get("test_size", 0.2)), "random_state": int(tts.get("random_state", 42)), "stratify": (strat if ttype=="binary" else None)},
+            "models": {},
+            "columns": list(X.columns),
         }
 
-        # Build design matrix
-        X, y, cols = build_feature_matrix(df, target, features, log_vars, square_vars, interactions)
-
-        # Split (stratify if classification)
-        strat = y if task == "classification" else None
-        X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=test_size, random_state=int(random_state), stratify=strat)
-
-        trained_for_target: Dict[str, Any] = st.session_state["trained_models"].get(target, {})
-
-        # Train each selected model
-        for mkey in chosen_models:
-            try:
-                if task == "regression" and mkey == "linear_regression":
-                    mdl = LinearRegression(n_jobs=None) if hasattr(LinearRegression, "__init__") else LinearRegression()
-                    mdl.fit(X_tr, y_tr)
-                    pred = mdl.predict(X_te)
-                    metrics = {
-                        "RMSE": float(np.sqrt(mean_squared_error(y_te, pred))),
-                        "MAE": float(mean_absolute_error(y_te, pred)),
-                        "R2": float(r2_score(y_te, pred)),
-                    }
-                    cal = None  # calibration not applicable
-                elif task == "regression" and mkey == "xgboost_regressor":
-                    if not HAS_XGB:
-                        st.warning("xgboost not available in this environment.")
-                        continue
-                    mdl = xgb.XGBRegressor(
-                        n_estimators=200,
-                        max_depth=4,
-                        learning_rate=0.08,
-                        subsample=0.9,
-                        colsample_bytree=0.8,
-                        reg_lambda=1.0,
-                        n_jobs=2,
-                        random_state=int(random_state),
-                    )
-                    mdl.fit(X_tr, y_tr)
-                    pred = mdl.predict(X_te)
-                    metrics = {
-                        "RMSE": float(np.sqrt(mean_squared_error(y_te, pred))),
-                        "MAE": float(mean_absolute_error(y_te, pred)),
-                        "R2": float(r2_score(y_te, pred)),
-                    }
-                    cal = None
-                elif task == "classification" and mkey == "logistic_regression":
-                    mdl = LogisticRegression(max_iter=1000, solver="lbfgs")
-                    mdl.fit(X_tr, y_tr.astype(int))
-                    prob = mdl.predict_proba(X_te)[:, 1]
-                    pred = (prob >= 0.5).astype(int)
-                    metrics = {
-                        "LogLoss": float(log_loss(y_te, prob, labels=[0,1])),
-                        "ROC_AUC": float(roc_auc_score(y_te, prob)),
-                        "Brier": float(brier_score_loss(y_te, prob)),
-                        "Accuracy@0.5": float(accuracy_score(y_te, pred)),
-                    }
-                    cal = calibration_table(y_te.to_numpy(), prob)
-                elif task == "classification" and mkey == "xgboost_classifier":
-                    if not HAS_XGB:
-                        st.warning("xgboost not available in this environment.")
-                        continue
-                    mdl = xgb.XGBClassifier(
-                        n_estimators=300,
-                        max_depth=4,
-                        learning_rate=0.08,
-                        subsample=0.9,
-                        colsample_bytree=0.8,
-                        reg_lambda=1.0,
-                        n_jobs=2,
-                        random_state=int(random_state),
-                        eval_metric="logloss",
-                        use_label_encoder=False,
-                    )
-                    mdl.fit(X_tr, y_tr.astype(int))
-                    prob = mdl.predict_proba(X_te)[:, 1]
-                    pred = (prob >= 0.5).astype(int)
-                    metrics = {
-                        "LogLoss": float(log_loss(y_te, prob, labels=[0,1])),
-                        "ROC_AUC": float(roc_auc_score(y_te, prob)),
-                        "Brier": float(brier_score_loss(y_te, prob)),
-                        "Accuracy@0.5": float(accuracy_score(y_te, pred)),
-                    }
-                    cal = calibration_table(y_te.to_numpy(), prob)
-                else:
-                    st.warning(f"Unknown model key: {mkey}")
-                    continue
-
-                trained_for_target[mkey] = {
-                    "task": task,
-                    "model": mdl,
-                    "metrics": metrics,
-                    "calibration": cal,   # DataFrame or None
-                    "feature_cols": cols, # training column order
-                    "spec": {
-                        "features": features,
-                        "log_vars": log_vars,
-                        "square_vars": square_vars,
-                        "interactions": interactions,
-                    },
+        for algo in algos:
+            if ttype == "continuous" and algo == "linear_regression":
+                est = LinearRegression().fit(X_train, y_train)
+                y_pred = est.predict(X_test)
+                rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+                mae = float(mean_absolute_error(y_test, y_pred))
+                r2 = float(r2_score(y_test, y_pred))
+                results["models"]["Linear Regression"] = {
+                    "estimator": est,
+                    "metrics": {"RMSE": rmse, "MAE": mae, "R2": r2},
+                    "pred_true": {"y_true": y_test.to_numpy(), "y_pred": y_pred},
                 }
-                st.success(f"Trained {mkey} for {target}.")
-            except Exception as e:
-                st.error(f"Training failed for {mkey}: {e}")
+                done += 1
 
-        st.session_state["trained_models"][target] = trained_for_target
+            if ttype == "continuous" and algo == "xgboost_regressor" and XGB_AVAILABLE:
+                est = XGBRegressor(
+                    n_estimators=250, max_depth=4, learning_rate=0.05,
+                    subsample=0.8, colsample_bytree=0.8, random_state=int(tts.get("random_state",42)),
+                    reg_lambda=1.0, n_jobs=4
+                ).fit(X_train, y_train)
+                y_pred = est.predict(X_test)
+                rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+                mae = float(mean_absolute_error(y_test, y_pred))
+                r2 = float(r2_score(y_test, y_pred))
+                results["models"]["XGBoost Regressor"] = {
+                    "estimator": est,
+                    "metrics": {"RMSE": rmse, "MAE": mae, "R2": r2},
+                    "pred_true": {"y_true": y_test.to_numpy(), "y_pred": y_pred},
+                }
+                done += 1
 
-    # Show a small preview
-    with st.expander("Preview a sample of the dataset used for estimation", expanded=False):
-        st.dataframe(df.head(10), use_container_width=True)
+            if ttype == "binary" and algo == "logistic_regression":
+                est = LogisticRegression(max_iter=1000).fit(X_train, y_train)
+                prob = est.predict_proba(X_test)[:,1]
+                rmse = float(np.sqrt(mean_squared_error(y_test, prob)))
+                mae = float(mean_absolute_error(y_test, prob))
+                ll = float(log_loss(y_test, prob))
+                prob_true, prob_pred = calibration_curve(y_test, prob, n_bins=12, strategy="uniform")
+                results["models"]["Logistic Regression"] = {
+                    "estimator": est,
+                    "metrics": {"RMSE": rmse, "MAE": mae, "LogLoss": ll},
+                    "pred_true": {"y_true": y_test.to_numpy(), "y_pred": prob},
+                    "calibration": {"prob_true": prob_true, "prob_pred": prob_pred},
+                }
+                done += 1
+
+            if ttype == "binary" and algo == "xgboost_classifier" and XGB_AVAILABLE:
+                est = XGBClassifier(
+                    n_estimators=350, max_depth=4, learning_rate=0.05,
+                    subsample=0.8, colsample_bytree=0.8, random_state=int(tts.get("random_state",42)),
+                    reg_lambda=1.0, n_jobs=4, eval_metric="logloss"
+                ).fit(X_train, y_train)
+                prob = est.predict_proba(X_test)[:,1]
+                rmse = float(np.sqrt(mean_squared_error(y_test, prob)))
+                mae = float(mean_absolute_error(y_test, prob))
+                ll = float(log_loss(y_test, prob))
+                prob_true, prob_pred = calibration_curve(y_test, prob, n_bins=12, strategy="uniform")
+                results["models"]["XGBoost Classifier"] = {
+                    "estimator": est,
+                    "metrics": {"RMSE": rmse, "MAE": mae, "LogLoss": ll},
+                    "pred_true": {"y_true": y_test.to_numpy(), "y_pred": prob},
+                    "calibration": {"prob_true": prob_true, "prob_pred": prob_pred},
+                }
+                done += 1
+
+            if show_progress:
+                pct = int(done / max(total_jobs,1) * 100)
+                progress.progress(min(pct, 100))
+                time.sleep(0.08)  # small delay to make the bar visible
+
+        # Store trained pack
+        st.session_state["trained_models"][target] = results
+
+        # Save a serializer-friendly meta summary for export
+        meta = {
+            "type": results["type"],
+            "feature_spec": results["feature_spec"],
+            "train_test_split": results["train_test_split"],
+            "columns": results["columns"],
+            "models": {name: {"metrics": info["metrics"]} for name, info in results["models"].items()},
+        }
+        st.session_state["trained_models_meta"][target] = meta
 
 
-# --------------------------- UI: Model Selection ---------------------------
+# --------------------------- Model Estimation Tab ---------------------------
+def model_estimation_tab():
+    top_cols = st.columns([1, 4, 1])
+    with top_cols[1]:
+        if st.button("Use default configuration", key="btn_default_estimation"):
+            apply_defaults_to_estimation()
+            st.success("Default estimation configurations added and UI pre-filled for BMI.")
+
+    st.subheader("🧮 Model estimation")
+
+    # Prepare training data
+    if "training_data" not in st.session_state:
+        st.info("Generating a synthetic training dataset based on your sidebar settings.")
+        st.session_state["training_data"] = generate_synthetic_population(
+            st.session_state.get("pop_n", 30_000), st.session_state.get("seed", 42)
+        )
+    df = st.session_state["training_data"]
+    vtypes = available_variables(df)
+
+    # Available variables with stats
+    st.markdown("**Available variables in dataset**")
+    stats_df = compute_stats_table(df, vtypes)
+    st.dataframe(stats_df, use_container_width=True, hide_index=True)
+
+    with st.expander("Preview first 20 rows", expanded=False):
+        st.dataframe(df.head(20), use_container_width=True, hide_index=True)
+
+    # Target & feature engineering UI with stable keys
+    st.markdown("**Choose a target variable to estimate**")
+    candidate_targets = [c for c,t in vtypes.items() if t in ("numeric", "binary")]
+    default_target = "bmi" if "bmi" in candidate_targets else candidate_targets[0]
+    target = st.selectbox("Target variable", options=candidate_targets, index=candidate_targets.index(default_target), key="est_target")
+    target_type = "binary" if vtypes.get(target) == "binary" else "continuous"
+    st.caption(f"Detected target type: **{target_type}**")
+
+    st.markdown("**Feature engineering**")
+    base_candidates = [c for c in vtypes.keys() if c != target]
+    base_default = [c for c in ["age", "log_income", "is_employed", "bmi"] if c in base_candidates]
+    base_features = st.multiselect("Base features", options=base_candidates, default=st.session_state.get("est_base_features", base_default), key="est_base_features")
+
+    numeric_bases = [c for c in base_features if str(df[c].dtype) in NUMERIC_LIKE]
+    col1, col2 = st.columns(2)
+    with col1:
+        log_feats = st.multiselect("Apply log(1+x) to", options=numeric_bases, default=st.session_state.get("est_log_feats", []), key="est_log_feats")
+    with col2:
+        sq_feats = st.multiselect("Apply square to", options=numeric_bases, default=st.session_state.get("est_sq_feats", []), key="est_sq_feats")
+
+    st.markdown("**Interactions (pairwise among selected numeric features)**")
+    seed_defaults = ["age", "bmi", "log_income"]
+    default_candidates = [v for v in seed_defaults if v in numeric_bases]
+    default_interacts = [f"{u}|{v}" for i,u in enumerate(default_candidates) for v in default_candidates[i+1:i+2]]
+    # string encode pairs to keep a stable widget key
+    all_pairs = [f"{u}|{v}" for i,u in enumerate(numeric_bases) for v in numeric_bases[i+1:]]
+    selected_pairs = st.multiselect(
+        "Select variables to fully interact (all pairwise products)",
+        options=all_pairs,
+        default=st.session_state.get("est_interacts", default_interacts),
+        key="est_interacts",
+    )
+    interactions = []
+    for pair in selected_pairs:
+        if "|" in pair:
+            u,v = pair.split("|",1)
+            if u in numeric_bases and v in numeric_bases:
+                interactions.append((u,v))
+
+    st.markdown("**Choose algorithm(s)**")
+    algos = []
+    if target_type == "continuous":
+        c1, c2 = st.columns(2)
+        with c1:
+            use_lin = st.checkbox("Linear Regression", value=st.session_state.get("est_use_lin", True), key="est_use_lin")
+        with c2:
+            if XGB_AVAILABLE:
+                use_xgb = st.checkbox("XGBoost (Regressor)", value=st.session_state.get("est_use_xgb_reg", True), key="est_use_xgb_reg")
+            else:
+                st.checkbox("XGBoost (Regressor)", value=False, disabled=True)
+                use_xgb = False
+        if use_lin: algos.append("linear_regression")
+        if use_xgb: algos.append("xgboost_regressor")
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            use_logit = st.checkbox("Logistic Regression", value=st.session_state.get("est_use_logit", True), key="est_use_logit")
+        with c2:
+            if XGB_AVAILABLE:
+                use_xgb = st.checkbox("XGBoost (Classifier)", value=st.session_state.get("est_use_xgb_cls", True), key="est_use_xgb_cls")
+            else:
+                st.checkbox("XGBoost (Classifier)", value=False, disabled=True)
+                use_xgb = False
+        if use_logit: algos.append("logistic_regression")
+        if use_xgb: algos.append("xgboost_classifier")
+
+    st.markdown("**Train / Test split**")
+    colA, colB, colC = st.columns(3)
+    with colA:
+        test_size = st.slider("Test size", min_value=0.05, max_value=0.5, value=st.session_state.get("est_test_size", 0.2), step=0.05, key="est_test_size")
+    with colB:
+        random_state = st.number_input("Random state", value=st.session_state.get("est_random_state", 42), step=1, key="est_random_state")
+    with colC:
+        stratify_candidates = [None] + base_candidates
+        stratify_opt = st.selectbox("Stratify (binary only)", options=stratify_candidates, index=0, key="est_stratify")
+        if target_type != "binary":
+            st.caption("Stratify is only used for classification.")
+
+    spec = {"base_features": base_features, "log": log_feats, "square": sq_feats, "interactions": interactions}
+
+    st.divider()
+    # RECORD decision (do not train yet)
+    colR1, colR2 = st.columns([1,2])
+    with colR1:
+        record = st.button("📌 Add/Update configuration for this target", type="primary", use_container_width=True, key="btn_record_config")
+    with colR2:
+        st.caption("Record all your choices below first; then train everything together.")
+
+    if record:
+        st.session_state.setdefault("pending_estimations", [])
+        entry = {
+            "target": target,
+            "target_type": target_type,
+            "spec": spec,
+            "algorithms": algos,
+            "train_test_split": {"test_size": float(test_size), "random_state": int(random_state), "stratify": stratify_opt if target_type=="binary" else None},
+        }
+        # Replace if target already exists
+        pending = st.session_state["pending_estimations"]
+        found = False
+        for i, p in enumerate(pending):
+            if p["target"] == target:
+                pending[i] = entry; found = True; break
+        if not found:
+            pending.append(entry)
+        st.success(f"Recorded configuration for `{target}`.")
+
+    # Show all recorded decisions
+    pend = st.session_state.get("pending_estimations", [])
+    if pend:
+        st.markdown("### Selected configurations")
+        rows = []
+        for p in pend:
+            rows.append({
+                "target": p["target"],
+                "type": p["target_type"],
+                "base_features": ", ".join(p["spec"]["base_features"]),
+                "log": ", ".join(p["spec"]["log"]),
+                "square": ", ".join(p["spec"]["square"]),
+                "interactions": ", ".join([f"{u}*{v}" for (u,v) in p["spec"]["interactions"]]),
+                "algorithms": ", ".join(p["algorithms"]),
+                "test_size": p["train_test_split"]["test_size"],
+                "random_state": p["train_test_split"]["random_state"],
+                "stratify": p["train_test_split"]["stratify"],
+            })
+        rec_df = pd.DataFrame(rows)
+        st.dataframe(rec_df, use_container_width=True, hide_index=True)
+
+        st.markdown("Train all selected configurations at once:")
+        if st.button("🧪 Train selected models", type="primary", use_container_width=True, key="btn_train_all"):
+            with st.spinner("Training models..."):
+                train_all_recorded_models(show_progress=True)
+            st.success("Training complete. Proceed to **Model selection** to choose which models to use.")
+
+    # Update config export mirror
+    pipe = st.session_state.get("config", default_config())["pipeline"]
+    pipe["estimation"] = {p["target"]: p for p in st.session_state.get("pending_estimations", [])}
+    pipe["trained"] = st.session_state.get("trained_models_meta", {})
+    st.session_state["config"]["pipeline"] = pipe
+
+
+# --------------------------- Model Selection Tab ---------------------------
 def model_selection_tab():
-    st.subheader("🧩 Model selection")
+    top_cols = st.columns([1, 4, 1])
+    with top_cols[1]:
+        if st.button("Use default configuration", key="btn_default_selection"):
+            apply_defaults_to_selection()
+            st.success("Default selections applied (prefers XGBoost where available).")
 
+    st.subheader("🧩 Model selection")
     trained = st.session_state.get("trained_models", {})
     if not trained:
-        st.info("No models have been trained yet. Go to **Model estimation** first.")
+        st.info("No models trained yet. Use **Model estimation** to record and train first.")
         return
 
-    target_list = sorted(list(trained.keys()))
-    target = st.selectbox("Select a target", target_list, index=0)
+    variables = list(trained.keys())
+    var = st.selectbox("Select a variable to inspect & choose model", options=variables, index=0, key="sel_target")
+    pack = trained[var]
+    mtype = pack["type"]
+    models_dict = pack["models"]
 
-    models_for_target = trained.get(target, {})
-    if not models_for_target:
-        st.warning("No models trained for this target yet.")
-        return
-
-    # Metrics comparison table
-    st.markdown("**Error metrics (evaluated on holdout test set)**")
+    st.markdown("**Error metrics comparison**")
     rows = []
-    for k, rec in models_for_target.items():
-        row = {"model": k}
-        for mk, mv in rec["metrics"].items():
-            row[mk] = mv
-        rows.append(row)
-    metrics_df = pd.DataFrame(rows).set_index("model")
-    st.dataframe(metrics_df, use_container_width=True)
+    for name, info in models_dict.items():
+        met = info["metrics"]
+        rows.append({"model": name, **met})
+    met_df = pd.DataFrame(rows)
 
-    # Calibration curve (if classification)
-    any_classif = any(rec["task"] == "classification" for rec in models_for_target.values())
-    if any_classif:
+    if mtype == "continuous":
+        col1, col2 = st.columns(2)
+        with col1:
+            rmse_chart = alt.Chart(met_df).mark_bar().encode(
+                x=alt.X("model:N", title="Model"),
+                y=alt.Y("RMSE:Q", title="RMSE"),
+                tooltip=["model", alt.Tooltip("RMSE:Q", format=".4f")]
+            ).properties(height=250)
+            st.altair_chart(rmse_chart, use_container_width=True)
+        with col2:
+            mae_chart = alt.Chart(met_df).mark_bar().encode(
+                x=alt.X("model:N", title="Model"),
+                y=alt.Y("MAE:Q", title="MAE"),
+                tooltip=["model", alt.Tooltip("MAE:Q", format=".4f")]
+            ).properties(height=250)
+            st.altair_chart(mae_chart, use_container_width=True)
+
+        st.markdown("**Predicted vs Actual (test set)**")
+        for name, info in models_dict.items():
+            d = pd.DataFrame({"y_true": info["pred_true"]["y_true"], "y_pred": info["pred_true"]["y_pred"]})
+            chart = alt.Chart(d).mark_circle(opacity=0.4).encode(
+                x=alt.X("y_true:Q", title="Actual"),
+                y=alt.Y("y_pred:Q", title="Predicted"),
+                tooltip=[alt.Tooltip("y_true:Q", format=".2f"), alt.Tooltip("y_pred:Q", format=".2f")]
+            ).properties(height=250, title=f"{name}")
+            st.altair_chart(chart, use_container_width=True)
+    else:
+        col1, col2 = st.columns(2)
+        with col1:
+            rmse_chart = alt.Chart(met_df).mark_bar().encode(
+                x=alt.X("model:N", title="Model"),
+                y=alt.Y("RMSE:Q", title="RMSE (prob vs 0/1)"),
+                tooltip=["model", alt.Tooltip("RMSE:Q", format=".4f")]
+            ).properties(height=250)
+            st.altair_chart(rmse_chart, use_container_width=True)
+        with col2:
+            mae_chart = alt.Chart(met_df).mark_bar().encode(
+                x=alt.X("model:N", title="Model"),
+                y=alt.Y("MAE:Q", title="MAE (prob vs 0/1)"),
+                tooltip=["model", alt.Tooltip("MAE:Q", format=".4f")]
+            ).properties(height=250)
+            st.altair_chart(mae_chart, use_container_width=True)
+
         st.markdown("**Calibration curves**")
-        for k, rec in models_for_target.items():
-            if rec["task"] != "classification" or rec["calibration"] is None:
+        layers = []
+        for name, info in models_dict.items():
+            cal = info.get("calibration")
+            if cal is None:
                 continue
-            caldf = rec["calibration"].copy()
-            caldf["model"] = k
-            line = alt.Chart(caldf).mark_line(point=True).encode(
-                x=alt.X("mean_pred:Q", title="Mean predicted probability"),
-                y=alt.Y("frac_pos:Q", title="Observed fraction positive"),
-                color="model:N",
-                tooltip=["model:N", alt.Tooltip("mean_pred:Q", format=".3f"), alt.Tooltip("frac_pos:Q", format=".3f"), "n:Q"],
+            d = pd.DataFrame({"prob_pred": cal["prob_pred"], "prob_true": cal["prob_true"], "model": name})
+            layers.append(d)
+        if layers:
+            dd = pd.concat(layers, ignore_index=True)
+            diag = alt.Chart(pd.DataFrame({"x":[0,1],"y":[0,1]})).mark_line().encode(x="x:Q", y="y:Q")
+            chart = diag + alt.Chart(dd).mark_line(point=True).encode(
+                x=alt.X("prob_pred:Q", title="Predicted probability (binned)"),
+                y=alt.Y("prob_true:Q", title="Empirical frequency"),
+                color=alt.Color("model:N", title="Model")
             ).properties(height=300)
-            # 45-degree reference
-            ref = alt.Chart(pd.DataFrame({"x":[0,1],"y":[0,1]})).mark_rule().encode(x="x", y="y")
-            st.altair_chart(line + ref, use_container_width=True)
+            st.altair_chart(chart, use_container_width=True)
 
-    # Choose the production model
-    model_keys = list(models_for_target.keys())
-    current_choice = st.session_state["selected_models"].get(target, model_keys[0])
-    choice = st.radio("Select model for simulation", model_keys, index=model_keys.index(current_choice), horizontal=True)
-    st.session_state["selected_models"][target] = choice
-    st.success(f"Using **{choice}** for **{target}** in the simulation.")
+    # Selection UI + model detail table
+    st.divider()
+    st.markdown("**Select model for simulation**")
+    model_names = list(models_dict.keys())
+    chosen = st.radio("Choose one", options=model_names, index=0, key="sel_chosen_model")
+    st.session_state.setdefault("chosen_models", {})
+    st.session_state["chosen_models"][var] = chosen
+    st.success(f"Selected: **{chosen}** for `{var}`")
 
-
-# --------------------------- UI: Interventions ---------------------------
-def intervention_editor(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    st.subheader("🧪 Interventions")
-
-    ic = cfg.get("intervention_config", {}) or {}
-
-    existing_keys = list(ic.keys())
-    if not existing_keys:
-        st.info("No interventions configured yet. Add one below to explore the UI.")
-        new_key = st.text_input("New intervention key (e.g., bmi)")
-        if st.button("Add Intervention", use_container_width=True) and new_key:
-            ic[new_key] = {
-                "type": "percentage_decrease",
-                "amount": 0.1,
-                "target_population": {"age": [30, 60], "bmi": [25, 60]},
-            }
-            cfg["intervention_config"] = ic
+    # Details: coefficients or feature importances
+    st.markdown("**Model details**")
+    info = models_dict[chosen]
+    cols = pack["columns"]
+    if chosen in ("Linear Regression", "Logistic Regression"):
+        est = info["estimator"]
+        coef = getattr(est, "coef_", None)
+        intercept = getattr(est, "intercept_", None)
+        if coef is not None:
+            if coef.ndim > 1:
+                coef = coef.ravel()
+            df_coef = pd.DataFrame({"feature": cols, "beta": coef})
+            if chosen == "Logistic Regression":
+                df_coef["odds_ratio"] = np.exp(df_coef["beta"])
+                st.dataframe(df_coef, use_container_width=True, hide_index=True)
+                st.caption(f"Intercept (log-odds): {float(intercept):+.4f} • OR: {float(np.exp(intercept)):.4f}")
+            else:
+                st.dataframe(df_coef, use_container_width=True, hide_index=True)
+                st.caption(f"Intercept: {float(intercept):+.4f}")
+        else:
+            st.info("No coefficients available for this estimator.")
     else:
-        key = st.selectbox("Choose an intervention to edit", existing_keys, index=0)
-        inv = ic.get(key, {})
-
-        with st.container(border=True):
-            c1, c2 = st.columns([1, 2])
-            with c1:
-                inv_type = st.selectbox("Intervention type", ["percentage_decrease", "absolute_change"], index=["percentage_decrease", "absolute_change"].index(inv.get("type", "percentage_decrease")))
-                inv["type"] = inv_type
-
-                if inv_type == "percentage_decrease":
-                    amt = st.slider("Amount (percent decrease of target variable)", 0.0, 1.0, float(inv.get("amount", 0.2)), 0.01, help="0.2 means a 20% decrease in the target variable for the selected population.")
-                else:
-                    amt = st.number_input("Amount (absolute change)", value=float(inv.get("amount", 1.0)))
-                inv["amount"] = float(amt)
-
-            with c2:
-                st.markdown("**Target population filters**")
-                tgt = inv.get("target_population", {}) or {}
-                a_min, a_max = _range_to_tuple(tgt.get("age"), (18, 90))
-                b_min, b_max = _range_to_tuple(tgt.get("bmi"), (15, 60))
-                a_min, a_max = st.slider("Age range", min_value=0, max_value=100, value=(int(a_min), int(a_max)))
-                b_min, b_max = st.slider("BMI range", min_value=10, max_value=100, value=(int(b_min), int(b_max)))
-                tgt["age"] = [int(a_min), int(a_max)]
-                tgt["bmi"] = [int(b_min), int(b_max)]
-                inv["target_population"] = tgt
-
-        # Save back
-        ic[key] = inv
-        cfg["intervention_config"] = ic
-
-    return cfg
-
-
-# --------------------------- Simulation helpers ---------------------------
-def apply_bmi_intervention(df: pd.DataFrame, intervention: Dict[str, Any]) -> pd.DataFrame:
-    """Apply a 'percentage_decrease' intervention on BMI for a target population."""
-    new_df = df.copy()
-    if not intervention or intervention.get("type") not in {"percentage_decrease", "absolute_change"}:
-        return new_df
-
-    tgt = intervention.get("target_population", {}) or {}
-    age_min, age_max = _range_to_tuple(tgt.get("age"), (18, 90))
-    bmi_min, bmi_max = _range_to_tuple(tgt.get("bmi"), (15, 60))
-
-    mask = (
-        (new_df["age"] >= age_min)
-        & (new_df["age"] <= age_max)
-        & (new_df["bmi"] >= bmi_min)
-        & (new_df["bmi"] <= bmi_max)
-    )
-    if intervention["type"] == "percentage_decrease":
-        amount = float(intervention.get("amount", 0.0))
-        new_df.loc[mask, "bmi"] = new_df.loc[mask, "bmi"] * (1.0 - amount)
-    else:
-        amount = float(intervention.get("amount", 0.0))
-        new_df.loc[mask, "bmi"] = new_df.loc[mask, "bmi"] + amount
-
-    return new_df
-
-
-def predict_with_record(df: pd.DataFrame, target: str, record: Dict[str, Any]) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    """Use a trained model record to produce predictions (and probabilities if classifier)."""
-    spec = record["spec"]
-    X_new, _, _ = build_feature_matrix(
-        df, target,
-        spec["features"],
-        spec["log_vars"],
-        spec["square_vars"],
-        spec["interactions"],
-    )
-    X_new = ensure_same_columns(X_new, record["feature_cols"])
-
-    mdl = record["model"]
-    if record["task"] == "regression":
-        yhat = mdl.predict(X_new)
-        return yhat, None
-    else:
-        # classifier
+        # XGBoost importances
+        est = info["estimator"]
         try:
-            proba = mdl.predict_proba(X_new)[:, 1]
+            fi = est.feature_importances_
+            df_imp = pd.DataFrame({"feature": cols, "importance": fi}).sort_values("importance", ascending=False)
+            st.dataframe(df_imp, use_container_width=True, hide_index=True)
         except Exception:
-            # Some xgboost versions require predict with output margin etc.
-            proba = mdl.predict(X_new)
-            if proba.ndim == 2 and proba.shape[1] == 2:
-                proba = proba[:, 1]
-            elif proba.ndim != 1:
-                proba = np.ravel(proba)
-        return (proba >= 0.5).astype(int), proba
+            st.info("Feature importances not available for this estimator.")
+
+    # Decisions summary
+    st.markdown("### Selections recorded")
+    all_sel = st.session_state.get("chosen_models", {})
+    if all_sel:
+        rows = []
+        for tgt, nm in all_sel.items():
+            rows.append({"target": tgt, "chosen_model": nm})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # Update export mirror
+    pipe = st.session_state.get("config", default_config())["pipeline"]
+    pipe["selection"] = st.session_state.get("chosen_models", {})
+    st.session_state["config"]["pipeline"] = pipe
 
 
-# --------------------------- UI: Run & Results ---------------------------
+# --------------------------- Interventions Tab ---------------------------
+def interventions_tab():
+    top_cols = st.columns([1, 4, 1])
+    with top_cols[1]:
+        if st.button("Use default configuration", key="btn_default_interventions"):
+            # build defaults using current data ranges
+            df = st.session_state.get("training_data")
+            if df is None:
+                df = generate_synthetic_population(st.session_state.get("pop_n", 30_000), st.session_state.get("seed", 42))
+                st.session_state["training_data"] = df
+            apply_defaults_to_interventions(df)
+            st.success("Added two default BMI interventions.")
+
+    st.subheader("🧪 Interventions")
+    st.caption("Add as many interventions as you like. For demo, filters support age and BMI.")
+    st.session_state.setdefault("interventions", [])
+    df = st.session_state.get("training_data")
+
+    vtypes = available_variables(df) if df is not None else {}
+    numeric_vars = [c for c,t in vtypes.items() if t in ("numeric","binary")]
+
+    # List existing interventions
+    to_delete = []
+    for idx, inv in enumerate(st.session_state["interventions"]):
+        with st.container(border=True):
+            st.markdown(f"**Intervention {idx+1}**")
+            col1, col2, col3 = st.columns([1,1,1])
+            with col1:
+                inv["target"] = st.selectbox("Target variable", options=numeric_vars, index=numeric_vars.index(inv.get("target","bmi")) if inv.get("target","bmi") in numeric_vars else 0, key=f"inv_target_{idx}")
+            with col2:
+                inv["type"] = st.selectbox("Type", options=["percentage_decrease","absolute_change"], index=["percentage_decrease","absolute_change"].index(inv.get("type","percentage_decrease")), key=f"inv_type_{idx}")
+            with col3:
+                inv["amount"] = st.number_input("Amount", value=float(inv.get("amount", 0.1)), step=0.01, key=f"inv_amount_{idx}")
+            st.markdown("**Filters**")
+            f = inv.get("filters", {})
+            a_min, a_max = _range_to_tuple(f.get("age"), (18, 90))
+            b_min, b_max = _range_to_tuple(f.get("bmi"), (15, 60))
+            age_min, age_max = st.slider("Age range", min_value=0, max_value=100, value=(int(a_min), int(a_max)), key=f"inv_age_{idx}")
+            bmi_min, bmi_max = st.slider("BMI range", min_value=10, max_value=100, value=(int(b_min), int(b_max)), key=f"inv_bmi_{idx}")
+            inv["filters"] = {"age": [age_min, age_max], "bmi": [bmi_min, bmi_max]}
+            if st.button("Remove", key=f"inv_remove_{idx}"):
+                to_delete.append(idx)
+        st.write("")
+
+    # delete requested
+    for i in sorted(to_delete, reverse=True):
+        del st.session_state["interventions"][i]
+
+    # Add new
+    if st.button("➕ Add intervention", key="btn_add_intervention"):
+        st.session_state["interventions"].append({"target": "bmi", "type": "percentage_decrease", "amount": 0.1, "filters": {"age":[30,60], "bmi":[25,60]}})
+
+    # Update export mirror
+    pipe = st.session_state.get("config", default_config())["pipeline"]
+    pipe["interventions"] = st.session_state.get("interventions", [])
+    st.session_state["config"]["pipeline"] = pipe
+
+
+# --------------------------- Run Simulation ---------------------------
 def run_and_visualize(cfg: Dict[str, Any]) -> None:
     st.subheader("🚀 Run Simulation")
 
-    pop_n = int(st.session_state.get("pop_n", 60_000))
+    pop_n = int(st.session_state.get("pop_n", 30_000))
     seed = int(st.session_state.get("seed", 42))
 
     c1, c2 = st.columns([1, 1])
     with c1:
-        st.caption("Generate a synthetic baseline population, optionally recompute outcomes with your selected models, and apply interventions.")
+        st.caption("Generate a synthetic baseline population, apply your interventions, and use your selected models.")
         go = st.button("Run Simulation", type="primary", use_container_width=True)
     with c2:
         st.caption("Export results or share a quick snapshot.")
         export_name = st.text_input("Export name", value="demo_run")
 
-    use_models = st.checkbox("Use selected models to compute baseline outcomes before interventions", value=True)
-
     if not go:
-        st.info("Train and select models, configure interventions, then click **Run Simulation**.")
+        st.info("Train & select models, configure interventions, then click **Run Simulation**.")
         return
 
-    # Generate baseline
+    # baseline data
     df_base = generate_synthetic_population(pop_n, seed=seed)
-    # Add default 'bmi' as measured; optionally recompute using selected model
+
+    # Predict BMI if a BMI model was selected
+    chosen = st.session_state.get("chosen_models", {})
     trained = st.session_state.get("trained_models", {})
-    selected = st.session_state.get("selected_models", {})
 
-    # If a model was selected for 'bmi' and user wants to apply models, recompute bmi
-    if use_models and "bmi" in selected and "bmi" in trained and selected["bmi"] in trained["bmi"]:
-        rec = trained["bmi"][selected["bmi"]]
-        yhat, _ = predict_with_record(df_base, "bmi", rec)
-        # Use predicted BMI as baseline BMI (demo choice)
-        df_base["bmi"] = yhat
+    if "bmi" in chosen and "bmi" in trained:
+        pack = trained["bmi"]
+        model_name = chosen["bmi"]
+        est = pack["models"][model_name]["estimator"]
+        Xb = build_design_matrix(df_base, "bmi", pack["feature_spec"])
+        for col in pack["columns"]:
+            if col not in Xb.columns: Xb[col] = 0.0
+        Xb = Xb[pack["columns"]]
+        df_base["bmi"] = est.predict(Xb)
 
-    # Baseline heart attack probability/model
-    if use_models and "hattack_event" in selected and "hattack_event" in trained and selected["hattack_event"] in trained["hattack_event"]:
-        rec_h = trained["hattack_event"][selected["hattack_event"]]
-        # For classification, predict probabilities if available
-        _, prob = predict_with_record(df_base, "hattack_event", rec_h)
-        if prob is None:
-            # Fall back to toy risk as probability
-            df_base["prob_hattack"] = risk_heart_attack(df_base)
+    # Apply all interventions
+    df_post = df_base.copy()
+    for inv in st.session_state.get("interventions", []):
+        df_post = apply_intervention(df_post, inv)
+
+    # Predict heart-attack probabilities if selected, otherwise fallback
+    if "hattack_ever_w10" in chosen and "hattack_ever_w10" in trained:
+        pack_h = trained["hattack_ever_w10"]
+        model_name_h = chosen["hattack_ever_w10"]
+        est_h = pack_h["models"][model_name_h]["estimator"]
+        # Baseline
+        Xh0 = build_design_matrix(df_base, "hattack_ever_w10", pack_h["feature_spec"])
+        for col in pack_h["columns"]:
+            if col not in Xh0.columns: Xh0[col] = 0.0
+        Xh0 = Xh0[pack_h["columns"]]
+        if pack_h["type"] == "binary":
+            if hasattr(est_h, "predict_proba"):
+                df_base["prob_hattack"] = est_h.predict_proba(Xh0)[:,1]
+            else:
+                df_base["prob_hattack"] = est_h.predict(Xh0)
         else:
-            df_base["prob_hattack"] = prob
+            df_base["prob_hattack"] = np.clip(est_h.predict(Xh0), 0, 1)
+
+        # Post
+        Xh1 = build_design_matrix(df_post, "hattack_ever_w10", pack_h["feature_spec"])
+        for col in pack_h["columns"]:
+            if col not in Xh1.columns: Xh1[col] = 0.0
+        Xh1 = Xh1[pack_h["columns"]]
+        if pack_h["type"] == "binary":
+            if hasattr(est_h, "predict_proba"):
+                df_post["prob_hattack"] = est_h.predict_proba(Xh1)[:,1]
+            else:
+                df_post["prob_hattack"] = est_h.predict(Xh1)
+        else:
+            df_post["prob_hattack"] = np.clip(est_h.predict(Xh1), 0, 1)
     else:
         df_base["prob_hattack"] = risk_heart_attack(df_base)
-
-    rng = np.random.default_rng(seed + 1)
-    df_base["hattack_event"] = (rng.random(size=len(df_base)) < df_base["prob_hattack"]).astype(int)
-
-    # Apply interventions (BMI only in this demo)
-    df_post = df_base.copy()
-    ic = cfg.get("intervention_config", {}) or {}
-    for key, inv in ic.items():
-        if key == "bmi":
-            df_post = apply_bmi_intervention(df_post, inv)
-
-    # Recompute outcome probabilities after intervention using selected model (or toy risk fallback)
-    if use_models and "hattack_event" in selected and "hattack_event" in trained and selected["hattack_event"] in trained["hattack_event"]:
-        rec_h = trained["hattack_event"][selected["hattack_event"]]
-        _, prob_post = predict_with_record(df_post, "hattack_event", rec_h)
-        if prob_post is None:
-            df_post["prob_hattack"] = risk_heart_attack(df_post)
-        else:
-            df_post["prob_hattack"] = prob_post
-    else:
         df_post["prob_hattack"] = risk_heart_attack(df_post)
 
-    rng = np.random.default_rng(seed + 2)
+    rng = np.random.default_rng(seed + 123)
+    df_base["hattack_event"] = (rng.random(size=len(df_base)) < df_base["prob_hattack"]).astype(int)
     df_post["hattack_event"] = (rng.random(size=len(df_post)) < df_post["prob_hattack"]).astype(int)
 
-    # Summaries
+    # summaries
+    s_base = {
+        "n": len(df_base),
+        "bmi_mean": float(df_base["bmi"].mean()),
+    }
+    s_post = {
+        "n": len(df_post),
+        "bmi_mean": float(df_post["bmi"].mean()),
+    }
     prev_base = float(df_base["hattack_event"].mean())
     prev_post = float(df_post["hattack_event"].mean())
-
     delta_prev_abs = prev_post - prev_base
     delta_prev_rel = (prev_post / prev_base - 1.0) if prev_base > 0 else math.nan
 
-    # ---- Top-level metrics
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Population", f"{len(df_base):,}")
-    m2.metric("Mean BMI (baseline)", f"{df_base['bmi'].mean():.2f}", delta=f"{(df_post['bmi'].mean()-df_base['bmi'].mean()):+.2f}")
-    m3.metric("Heart attack prevalence (baseline)", f"{prev_base*100:.2f}%", delta=f"{delta_prev_abs*100:+.2f}%")
+    m2.metric("Mean BMI (baseline)", f"{s_base['bmi_mean']:.2f}", delta=f"{(s_post['bmi_mean']-s_base['bmi_mean']):+.2f}")
+    m3.metric("Heart attack prevalence (baseline)", f"{prev_base*100:.2f}%",
+              delta=f"{delta_prev_abs*100:+.2f}%")
     m4.metric("Relative change in prevalence", f"{delta_prev_rel*100:+.2f}%")
 
     st.divider()
 
-    # ---- Charts
     col_left, col_right = st.columns([1.2, 1])
     with col_left:
         st.markdown("**BMI distribution (baseline vs. post-intervention)**")
         b0 = df_base[["bmi"]].copy(); b0["state"] = "Baseline"
         b1 = df_post[["bmi"]].copy(); b1["state"] = "Post"
         tidy_bmi = pd.concat([b0, b1], ignore_index=True)
-
         bins = alt.Bin(maxbins=40)
-        chart_bmi = alt.Chart(tidy_bmi).transform_bin(["bmi_bin"], field="bmi", bin=bins).mark_bar(opacity=0.6).encode(
+        chart_bmi = alt.Chart(tidy_bmi).transform_bin(
+            ["bmi_bin"], field="bmi", bin=bins
+        ).mark_bar(opacity=0.6).encode(
             x=alt.X("bmi_bin:Q", title="BMI (binned)"),
             y=alt.Y("count()", stack=None, title="Count"),
             color=alt.Color("state:N", title="Scenario"),
@@ -770,7 +997,10 @@ def run_and_visualize(cfg: Dict[str, Any]) -> None:
 
     with col_right:
         st.markdown("**Prevalence of heart attack (baseline vs. post)**")
-        prev_df = pd.DataFrame({"scenario": ["Baseline", "Post"], "prevalence": [prev_base * 100.0, prev_post * 100.0]})
+        prev_df = pd.DataFrame({
+            "scenario": ["Baseline", "Post"],
+            "prevalence": [prev_base * 100.0, prev_post * 100.0],
+        })
         chart_prev = alt.Chart(prev_df).mark_bar().encode(
             x=alt.X("scenario:N", title=None),
             y=alt.Y("prevalence:Q", title="Prevalence (%)"),
@@ -780,15 +1010,13 @@ def run_and_visualize(cfg: Dict[str, Any]) -> None:
 
     st.divider()
 
-    # ---- By age group breakdown
     st.markdown("**Breakdown by age group**")
     def _breakdown(df: pd.DataFrame) -> pd.DataFrame:
         bins = [18, 30, 40, 50, 60, 70, 90]
         labels = ["18–29", "30–39", "40–49", "50–59", "60–69", "70–89"]
         g = pd.cut(df["age"], bins=bins, labels=labels, right=False, include_lowest=True)
         out = (
-            df.assign(age_group=g)
-            .groupby("age_group", as_index=False)
+            df.assign(age_group=g).groupby("age_group", as_index=False)
             .agg(n=("age", "size"), bmi_mean=("bmi", "mean"), prev=("hattack_event", "mean"))
         )
         out["prev"] = out["prev"] * 100.0
@@ -798,7 +1026,9 @@ def run_and_visualize(cfg: Dict[str, Any]) -> None:
     br_post = _breakdown(df_post)
     merged = br_base.merge(br_post, on="age_group", suffixes=("_base", "_post"))
 
-    c = alt.Chart(merged).transform_fold(["prev_base", "prev_post"], as_=["scenario", "value"]).mark_line(point=True).encode(
+    c = alt.Chart(merged).transform_fold(
+        ["prev_base", "prev_post"], as_=["scenario", "value"],
+    ).mark_line(point=True).encode(
         x=alt.X("age_group:N", title="Age group"),
         y=alt.Y("value:Q", title="Prevalence (%)", scale=alt.Scale(zero=False)),
         color=alt.Color("scenario:N", title=""),
@@ -806,77 +1036,100 @@ def run_and_visualize(cfg: Dict[str, Any]) -> None:
     ).properties(height=300)
     st.altair_chart(c, use_container_width=True)
 
-    st.caption("Note: All models and outputs here are illustrative. Replace with your trained models and data pipeline.")
+    st.caption("Note: Models and outputs here are illustrative.")
 
-    # ---- Data export
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.download_button(
-            "⬇️ Download baseline microdata (CSV)",
-            data=df_base.to_csv(index=False).encode("utf-8"),
-            file_name=f"{export_name}_baseline.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-    with col_b:
-        st.download_button(
-            "⬇️ Download post-intervention microdata (CSV)",
-            data=df_post.to_csv(index=False).encode("utf-8"),
-            file_name=f"{export_name}_post.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+    # Option to download results
+    # col_a, col_b = st.columns(2)
+    # with col_a:
+    #     st.download_button(
+    #         "⬇️ Download baseline microdata (CSV)",
+    #         data=df_base.to_csv(index=False).encode("utf-8"),
+    #         file_name=f"{export_name}_baseline.csv",
+    #         mime="text/csv",
+    #         use_container_width=True,
+    #     )
+    # with col_b:
+    #     st.download_button(
+    #         "⬇️ Download post-intervention microdata (CSV)",
+    #         data=df_post.to_csv(index=False).encode("utf-8"),
+    #         file_name=f"{export_name}_post.csv",
+    #         mime="text/csv",
+    #         use_container_width=True,
+    #     )
 
 
-# --------------------------- UI: Raw JSON ---------------------------
+# --------------------------- JSON View ---------------------------
 def raw_json_view(cfg: Dict[str, Any]) -> None:
-    st.subheader("🧾 Raw JSON (current in-session config)")
-    st.json(cfg, expanded=False)
-    if "raw_uploaded_text" in st.session_state and st.session_state["raw_uploaded_text"]:
+    st.subheader("🧾 JSON configuration")
+    st.json(build_pipeline_json(), expanded=False)
+    if "raw_uploaded_text" in st.session_state:
         with st.expander("Original uploaded text", expanded=False):
             st.code(st.session_state["raw_uploaded_text"], language="json")
-    if "cleaned_uploaded_text" in st.session_state and st.session_state["cleaned_uploaded_text"]:
+    if "cleaned_uploaded_text" in st.session_state:
         with st.expander("Cleaned JSON used for parsing", expanded=False):
             st.code(st.session_state["cleaned_uploaded_text"], language="json")
 
 
+def build_pipeline_json() -> Dict[str, Any]:
+    scenario_name = st.session_state.get("scenario_name", "Demo Scenario")
+    pipe = st.session_state.get("config", default_config()).get("pipeline", {})
+    # Pull live mirrors from session
+    estimation = {p["target"]: p for p in st.session_state.get("pending_estimations", [])}
+    trained = st.session_state.get("trained_models_meta", {})
+    selection = st.session_state.get("chosen_models", {})
+    interventions = st.session_state.get("interventions", [])
+
+    # Optionally include data summary for context (computed from synthetic training data)
+    df = st.session_state.get("training_data")
+    data_summary = None
+    if df is not None:
+        vtypes = available_variables(df)
+        data_summary = compute_stats_table(df, vtypes).to_dict(orient="records")
+
+    return {
+        "meta": {"name": scenario_name},
+        "pipeline": {
+            "estimation": estimation,
+            "trained": trained,
+            "selection": selection,
+            "interventions": interventions,
+        },
+        "data_summary": data_summary,
+    }
+
+
 # --------------------------- App Entry ---------------------------
 def main():
-    st.title("📈 Economic Simulation — Prototype")
+    st.title("📈 Simulation Engine for Preventative Health Interventions - 🤖 Prototype")
     st.caption(
-        "New workflow: (0) Estimate models from your dataset, (1) compare and select models, "
-        "(2) configure interventions, (3) run the simulation."
+        "Estimate models from data, compare candidate models, select the ones to use, configure multiple interventions, "
+        "simulate outcomes, analyse and export results."
     )
 
-    # Sidebar controls and optional upload
-    cfg = sidebar_config_controls(default_config())
+    cfg = sidebar_controls(default_config())
 
-    # Tabs
-    t0, t1, t2, t3, t4 = st.tabs([
-        "0) Model estimation",
-        "1) Model selection",
-        "2) Interventions",
-        "3) Run & Results",
-        "4) JSON",
-    ])
-    with t0:
+    # Ensure training data exists early for defaults
+    if "training_data" not in st.session_state:
+        st.session_state["training_data"] = generate_synthetic_population(
+            st.session_state.get("pop_n", 30_000), st.session_state.get("seed", 42)
+        )
+
+    tabs = st.tabs(["0) Model estimation", "1) Model selection", "2) Interventions", "3) Run & Results", "4) JSON config"])
+    with tabs[0]:
         model_estimation_tab()
-    with t1:
+    with tabs[1]:
         model_selection_tab()
-    with t2:
-        cfg = intervention_editor(cfg)
-    with t3:
+    with tabs[2]:
+        interventions_tab()
+    with tabs[3]:
         run_and_visualize(cfg)
-    with t4:
+    with tabs[4]:
         raw_json_view(cfg)
 
-    # Footer
     st.divider()
-    st.markdown(
-        "Built as a demonstration stub • Replace synthetic data and toy risk models with your own pipeline. "
-        "This UI is purposely simple and extensible."
-    )
-
+    st.markdown("Built for demonstration purposes only.")
 
 if __name__ == "__main__":
+    if "config" not in st.session_state:
+        st.session_state["config"] = default_config()
     main()
